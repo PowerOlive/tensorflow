@@ -25,6 +25,7 @@ import threading
 import warnings
 import weakref
 
+from absl import logging
 import numpy as np
 import six
 from six.moves import queue as Queue  # pylint: disable=redefined-builtin
@@ -1869,6 +1870,15 @@ name=None))
   def flat_map(self, map_func):
     """Maps `map_func` across this dataset and flattens the result.
 
+    The type signature is:
+
+    ```
+    def flat_map(
+      self: Dataset[T],
+      map_func: Callable[[T], Dataset[S]]
+    ) -> Dataset[S]
+    ```
+
     Use `flat_map` if you want to make sure that the order of your dataset
     stays the same. For example, to flatten a dataset of batches into a
     dataset of their elements:
@@ -1899,6 +1909,15 @@ name=None))
                  num_parallel_calls=None,
                  deterministic=None):
     """Maps `map_func` across this dataset, and interleaves the results.
+
+    The type signature is:
+
+    ```
+    def interleave(
+      self: Dataset[T],
+      map_func: Callable[[T], Dataset[S]]
+    ) -> Dataset[S]
+    ```
 
     For example, you can use `Dataset.interleave()` to process many input files
     concurrently:
@@ -1962,7 +1981,8 @@ name=None))
     ...     deterministic=False)
 
     Args:
-      map_func: A function mapping a dataset element to a dataset.
+      map_func: A function that takes a dataset element and returns a
+        `tf.data.Dataset`.
       cycle_length: (Optional.) The number of input elements that will be
         processed concurrently. If not set, the tf.data runtime decides what it
         should be based on available CPU. If `num_parallel_calls` is set to
@@ -2062,63 +2082,132 @@ name=None))
     return dataset
 
   def window(self, size, shift=None, stride=1, drop_remainder=False):
-    """Combines (nests of) input elements into a dataset of (nests of) windows.
+    """Returns a dataset of "windows".
 
-    A "window" is a finite dataset of flat elements of size `size` (or possibly
-    fewer if there are not enough input elements to fill the window and
+    Each "window" is a dataset that contains a subset of elements of the
+    input dataset. These are finite datasets of size `size` (or possibly fewer
+    if there are not enough input elements to fill the window and
     `drop_remainder` evaluates to `False`).
 
-    The `shift` argument determines the number of input elements by which the
-    window moves on each iteration.  If windows and elements are both numbered
+    For example:
+
+    >>> dataset = tf.data.Dataset.range(7).window(3)
+    >>> for window in dataset:
+    ...   print(window)
+    <...Dataset shapes: (), types: tf.int64>
+    <...Dataset shapes: (), types: tf.int64>
+    <...Dataset shapes: (), types: tf.int64>
+
+    Since windows are datasets, they can be iterated over:
+
+    >>> for window in dataset:
+    ...   print([item.numpy() for item in window])
+    [0, 1, 2]
+    [3, 4, 5]
+    [6]
+
+    #### Shift
+
+    The `shift` argument determines the number of input elements to shift
+    between the start of each window. If windows and elements are both numbered
     starting at 0, the first element in window `k` will be element `k * shift`
     of the input dataset. In particular, the first element of the first window
     will always be the first element of the input dataset.
 
-    The `stride` argument determines the stride of the input elements, and the
-    `shift` argument determines the shift of the window.
-
-    For example:
-
-    >>> dataset = tf.data.Dataset.range(7).window(2)
-    >>> for window in dataset:
-    ...   print(list(window.as_numpy_iterator()))
-    [0, 1]
-    [2, 3]
-    [4, 5]
-    [6]
-    >>> dataset = tf.data.Dataset.range(7).window(3, 2, 1, True)
+    >>> dataset = tf.data.Dataset.range(7).window(3, shift=1,
+    ...                                           drop_remainder=True)
     >>> for window in dataset:
     ...   print(list(window.as_numpy_iterator()))
     [0, 1, 2]
+    [1, 2, 3]
     [2, 3, 4]
+    [3, 4, 5]
     [4, 5, 6]
-    >>> dataset = tf.data.Dataset.range(7).window(3, 1, 2, True)
+
+    #### Stride
+
+    The `stride` argument determines the stride between input elements within a
+    window.
+
+    >>> dataset = tf.data.Dataset.range(7).window(3, shift=1, stride=2,
+    ...                                           drop_remainder=True)
     >>> for window in dataset:
     ...   print(list(window.as_numpy_iterator()))
     [0, 2, 4]
     [1, 3, 5]
     [2, 4, 6]
 
-    Note that when the `window` transformation is applied to a dataset of
-    nested elements, it produces a dataset of nested windows.
+    #### Nested elements
 
-    >>> nested = ([1, 2, 3, 4], [5, 6, 7, 8])
-    >>> dataset = tf.data.Dataset.from_tensor_slices(nested).window(2)
-    >>> for window in dataset:
-    ...   def to_numpy(ds):
-    ...     return list(ds.as_numpy_iterator())
-    ...   print(tuple(to_numpy(component) for component in window))
-    ([1, 2], [5, 6])
-    ([3, 4], [7, 8])
+    When the `window` transformation is applied to a dataset whos elements are
+    nested structures, it produces a dataset where the elements have the same
+    nested structure but each leaf is replaced by a window. In other words,
+    the nesting is applied outside of the windows as opposed inside of them.
 
-    >>> dataset = tf.data.Dataset.from_tensor_slices({'a': [1, 2, 3, 4]})
+    The type signature is:
+
+    ```
+    def window(
+        self: Dataset[Nest[T]], ...
+    ) -> Dataset[Nest[Dataset[T]]]
+    ```
+
+    Applying `window` to a `Dataset` of tuples gives a tuple of windows:
+
+    >>> dataset = tf.data.Dataset.from_tensor_slices(([1, 2, 3, 4, 5],
+    ...                                               [6, 7, 8, 9, 10]))
     >>> dataset = dataset.window(2)
-    >>> for window in dataset:
-    ...   def to_numpy(ds):
-    ...     return list(ds.as_numpy_iterator())
-    ...   print({'a': to_numpy(window['a'])})
-    {'a': [1, 2]}
-    {'a': [3, 4]}
+    >>> windows = next(iter(dataset))
+    >>> windows
+    (<...Dataset shapes: (), types: tf.int32>,
+     <...Dataset shapes: (), types: tf.int32>)
+
+    >>> def to_numpy(ds):
+    ...   return list(ds.as_numpy_iterator())
+    >>>
+    >>> for windows in dataset:
+    ...   print(to_numpy(windows[0]), to_numpy(windows[1]))
+    [1, 2] [6, 7]
+    [3, 4] [8, 9]
+    [5] [10]
+
+    Applying `window` to a `Dataset` of dictionaries gives a dictionary of
+    `Datasets`:
+
+    >>> dataset = tf.data.Dataset.from_tensor_slices({'a': [1, 2, 3],
+    ...                                               'b': [4, 5, 6],
+    ...                                               'c': [7, 8, 9]})
+    >>> dataset = dataset.window(2)
+    >>> def to_numpy(ds):
+    ...   return list(ds.as_numpy_iterator())
+    >>>
+    >>> for windows in dataset:
+    ...   print(tf.nest.map_structure(to_numpy, windows))
+    {'a': [1, 2], 'b': [4, 5], 'c': [7, 8]}
+    {'a': [3], 'b': [6], 'c': [9]}
+
+    #### Flatten a dataset of windows
+
+    The `Dataset.flat_map` and `Dataset.interleave` methods can be used to
+    flatten a dataset of windows into a single dataset.
+
+    The argument to `flat_map` is a function that takes an element from the
+    dataset and returns a `Dataset`. `flat_map` chains together the resulting
+    datasets sequentially.
+
+    For example, to turn each window into a dense tensor:
+
+    >>> size = 3
+    >>> dataset = tf.data.Dataset.range(7).window(size, shift=1,
+    ...                                           drop_remainder=True)
+    >>> batched = dataset.flat_map(lambda x:x.batch(3))
+    >>> for batch in batched:
+    ...   print(batch.numpy())
+    [0 1 2]
+    [1 2 3]
+    [2 3 4]
+    [3 4 5]
+    [4 5 6]
 
     Args:
       size: A `tf.int64` scalar `tf.Tensor`, representing the number of elements
@@ -2134,9 +2223,8 @@ name=None))
         `size`.
 
     Returns:
-      Dataset: A `Dataset` of (nests of) windows -- a finite datasets of flat
-        elements created from the (nests of) input elements.
-
+      Dataset: A `Dataset` of (nests of) windows. Each window is a finite
+        datasets of flat elements.
     """
     if shift is None:
       shift = size
@@ -2297,7 +2385,7 @@ name=None))
     expressed as `tf.data.Dataset` operations, and you want to use those
     transformations while serving your model.
 
-    # Keras
+    #### Keras
 
     ```python
 
@@ -2322,7 +2410,7 @@ name=None))
                   )
     ```
 
-    # Estimator
+    #### Estimator
 
     In the case of estimators, you need to generally define a `serving_input_fn`
     which would require the features to be processed by the model while
@@ -3395,6 +3483,18 @@ def make_one_shot_iterator(dataset):
 
   Returns:
     A `tf.data.Iterator` for elements of `dataset`.
+
+  @compatibility(TF2)
+  This is a legacy API for consuming dataset elements and should only be used
+  during transition from TF 1 to TF 2. Note that using this API should be
+  a transient state of your code base as there are in general no guarantees
+  about the interoperability of TF 1 and TF 2 code.
+
+  In TF 2 datasets are Python iterables which means you can consume their
+  elements using `for elem in dataset: ...` or by explicitly creating iterator
+  via `iterator = iter(dataset)` and fetching its elements via
+  `values = next(iterator)`.
+  @end_compatibility
   """
   try:
     # Call the defined `_make_one_shot_iterator()` if there is one, because some
@@ -3429,6 +3529,18 @@ def make_initializable_iterator(dataset, shared_name=None):
 
   Raises:
     RuntimeError: If eager execution is enabled.
+
+  @compatibility(TF2)
+  This is a legacy API for consuming dataset elements and should only be used
+  during transition from TF 1 to TF 2. Note that using this API should be
+  a transient state of your code base as there are in general no guarantees
+  about the interoperability of TF 1 and TF 2 code.
+
+  In TF 2 datasets are Python iterables which means you can consume their
+  elements using `for elem in dataset: ...` or by explicitly creating iterator
+  via `iterator = iter(dataset)` and fetching its elements via
+  `values = next(iterator)`.
+  @end_compatibility
   """
   try:
     # Call the defined `_make_initializable_iterator()` if there is one, because
@@ -3473,6 +3585,11 @@ def get_legacy_output_classes(dataset_or_iterator):
     A (nested) structure of Python `type` objects matching the structure of the
     dataset / iterator elements and specifying the class of the individual
     components.
+
+  @compatibility(TF2)
+  This is a legacy API for inspecting the type signature of dataset elements. In
+  TF 2, you should use the `tf.data.Dataset.element_spec` attribute instead.
+  @end_compatibility
   """
   return nest.map_structure(
       lambda component_spec: component_spec._to_legacy_output_classes(),  # pylint: disable=protected-access
@@ -3490,6 +3607,11 @@ def get_legacy_output_shapes(dataset_or_iterator):
     A (nested) structure of `tf.TensorShape` objects matching the structure of
     the dataset / iterator elements and specifying the shape of the individual
     components.
+
+  @compatibility(TF2)
+  This is a legacy API for inspecting the type signature of dataset elements. In
+  TF 2, you should use the `tf.data.Dataset.element_spec` attribute instead.
+  @end_compatibility
   """
   return nest.map_structure(
       lambda component_spec: component_spec._to_legacy_output_shapes(),  # pylint: disable=protected-access
@@ -3507,6 +3629,11 @@ def get_legacy_output_types(dataset_or_iterator):
     A (nested) structure of `tf.DType` objects matching the structure of
     dataset / iterator elements and specifying the shape of the individual
     components.
+
+  @compatibility(TF2)
+  This is a legacy API for inspecting the type signature of dataset elements. In
+  TF 2, you should use the `tf.data.Dataset.element_spec` attribute instead.
+  @end_compatibility
   """
   return nest.map_structure(
       lambda component_spec: component_spec._to_legacy_output_types(),  # pylint: disable=protected-access
@@ -3574,14 +3701,6 @@ class Options(options_lib.OptionsBase):
       "frequency is determined by the number of devices attached to this "
       "input pipeline. If None, defaults to False.")
 
-  experimental_threading = options_lib.create_option(
-      name="experimental_threading",
-      ty=threading_options.ThreadingOptions,
-      docstring=
-      "The threading options associated with the dataset. See "
-      "`tf.data.experimental.ThreadingOptions` for more details.",
-      default_factory=threading_options.ThreadingOptions)
-
   experimental_external_state_policy = options_lib.create_option(
       name="experimental_external_state_policy",
       ty=distribute_options.ExternalStatePolicy,
@@ -3591,6 +3710,29 @@ class Options(options_lib.OptionsBase):
       "IGNORE: External state is ignored without a warning; WARN: External "
       "state is ignored and a warning is logged; FAIL: External state results "
       "in an error.")
+
+  threading = options_lib.create_option(
+      name="threading",
+      ty=threading_options.ThreadingOptions,
+      docstring="The threading options associated with the dataset. See "
+      "`tf.data.ThreadingOptions` for more details.",
+      default_factory=threading_options.ThreadingOptions)
+
+  def __getattr__(self, name):
+    if name == "experimental_threading":
+      logging.warning("options.experimental_threading is deprecated. "
+                      "Use options.threading instead.")
+      return getattr(self, "threading")
+    else:
+      raise AttributeError("Attribute %s not found." % name)
+
+  def __setattr__(self, name, value):
+    if name == "experimental_threading":
+      logging.warning("options.experimental_threading is deprecated. "
+                      "Use options.threading instead.")
+      super(Options, self).__setattr__("threading", value)
+    else:
+      super(Options, self).__setattr__(name, value)
 
   def _to_proto(self):
     pb = dataset_options_pb2.Options()
@@ -3604,7 +3746,7 @@ class Options(options_lib.OptionsBase):
     pb.optimization_options.CopyFrom(self.experimental_optimization._to_proto())  # pylint: disable=protected-access
     if self.experimental_slack is not None:
       pb.slack = self.experimental_slack
-    pb.threading_options.CopyFrom(self.experimental_threading._to_proto())  # pylint: disable=protected-access
+    pb.threading_options.CopyFrom(self.threading._to_proto())  # pylint: disable=protected-access
     return pb
 
   def _from_proto(self, pb):
@@ -3618,7 +3760,7 @@ class Options(options_lib.OptionsBase):
     self.experimental_optimization._from_proto(pb.optimization_options)  # pylint: disable=protected-access
     if pb.WhichOneof("optional_slack") is not None:
       self.experimental_slack = pb.slack
-    self.experimental_threading._from_proto(pb.threading_options)  # pylint: disable=protected-access
+    self.threading._from_proto(pb.threading_options)  # pylint: disable=protected-access
 
   def _set_mutable(self, mutable):
     """Change the mutability value to `mutable` on this options and children."""
@@ -3626,7 +3768,7 @@ class Options(options_lib.OptionsBase):
     object.__setattr__(self, "_mutable", mutable)
     self.experimental_distribute._set_mutable(mutable)
     self.experimental_optimization._set_mutable(mutable)
-    self.experimental_threading._set_mutable(mutable)
+    self.threading._set_mutable(mutable)
 
   def merge(self, options):
     """Merges itself with the given `tf.data.Options`.
@@ -3975,22 +4117,6 @@ class StructuredFunctionWrapper(object):
 
     ag_ctx = autograph_ctx.control_status_ctx()
 
-    def warn_if_collections(transformation_name):
-      """Prints a warning if the given graph uses common graph collections.
-
-      NOTE(mrry): Currently a warning is only generated for resources. Any
-      variables created will be automatically hoisted out to the outermost scope
-      using `init_scope()`. Some collections (such as for control-flow contexts)
-      are benign and should not generate a warning.
-
-      Args:
-        transformation_name: A human-readable name for the transformation.
-      """
-      warnings.warn("Creating resources inside a function passed to %s "
-                    "is not supported. Create each resource outside the "
-                    "function, and capture it inside the function to use it." %
-                    transformation_name, stacklevel=5)
-
     def wrapper_helper(*args):
       """Wrapper for passing nested structures to and from tf.data functions."""
       nested_args = structure.from_compatible_tensor_list(
@@ -4090,19 +4216,14 @@ class StructuredFunctionWrapper(object):
               "`tf.data.experimental.enable_debug_mode()`.")
         fn_factory = trace_tf_function(defun_kwargs)
 
-    resource_tracker = tracking.ResourceTracker()
-    with tracking.resource_tracker_scope(resource_tracker):
-      self._function = fn_factory()
-      # There is no graph to add in eager mode.
-      add_to_graph &= not context.executing_eagerly()
-      # There are some lifetime issues when a legacy function is not added to a
-      # out-living graph. It's already deprecated so de-prioritizing the fix.
-      add_to_graph |= use_legacy_function
-      if add_to_graph:
-        self._function.add_to_graph(ops.get_default_graph())
-
-    if resource_tracker.resources:
-      warn_if_collections(transformation_name)
+    self._function = fn_factory()
+    # There is no graph to add in eager mode.
+    add_to_graph &= not context.executing_eagerly()
+    # There are some lifetime issues when a legacy function is not added to a
+    # out-living graph. It's already deprecated so de-prioritizing the fix.
+    add_to_graph |= use_legacy_function
+    if add_to_graph:
+      self._function.add_to_graph(ops.get_default_graph())
 
     if not use_legacy_function:
       outer_graph_seed = ops.get_default_graph().seed
